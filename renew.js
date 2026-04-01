@@ -116,6 +116,12 @@ async function parseRemainingMinutes(page) {
   } catch (e) { console.log('⚠️ 解析失败:', e.message); return null; }
 }
 
+function calcNextCheckDays(afterH) {
+  // 距离进入续签窗口（<16h）还有多久，提前2h到达作为缓冲
+  var hoursUntilWindow = afterH - 16 - 2;
+  return Math.max(1, Math.floor(hoursUntilWindow / 24));
+}
+
 function updateNextCheckDate(daysLater, reason) {
   var next = addDaysStr(getTodayStr(), daysLater);
   var status = loadStatus();
@@ -128,7 +134,9 @@ function updateNextCheckDate(daysLater, reason) {
 
 async function tryRenew(page, beforeMins) {
   try {
-    console.log('🔄 滚动到页面底部...'); await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)); await page.waitForTimeout(2000);
+    console.log('🔄 滚动到页面底部...');
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(2000);
     await page.getByRole('link', { name: '期限を延長する' }).waitFor({ state: 'visible', timeout: 5000 });
     await page.getByRole('link', { name: '期限を延長する' }).click();
     await page.waitForLoadState('load');
@@ -142,18 +150,29 @@ async function tryRenew(page, beforeMins) {
     await page.getByRole('link', { name: '戻る' }).click();
     await page.waitForLoadState('load');
     await page.screenshot({ path: 'success.png' });
+
     var afterMins = await parseRemainingMinutes(page);
     var beforeH = beforeMins ? (beforeMins / 60).toFixed(1) : '?';
     var afterH = afterMins ? (afterMins / 60).toFixed(1) : '?';
     var timeInfo = '续签前 ' + beforeH + 'h → 续签后 ' + afterH + 'h';
     console.log('⏱️ ' + timeInfo);
+
     var status = loadStatus();
     if (!status[ACC]) status[ACC] = {};
     status[ACC].lastSuccess = Date.now();
     saveStatus(status);
-    // 续签后固定为48h，30h后再检查（48-16-2缓冲=30h，约1天）
-    updateNextCheckDate(1, '续签成功，48h周期，1天后检查');
-    await sendTG('✅', '续签成功', timeInfo + '\n续签后约48h，下次检查1天后', 'success.png');
+
+    if (afterMins !== null) {
+      // 根据续签后实际剩余时间动态计算下次检查时机
+      var afterHNum = afterMins / 60;
+      var skipDays = calcNextCheckDays(afterHNum);
+      updateNextCheckDate(skipDays, '续签成功，续签后' + afterHNum.toFixed(1) + 'h，' + skipDays + '天后检查');
+      await sendTG('✅', '续签成功', timeInfo + '\n续签后' + afterHNum.toFixed(1) + 'h，下次检查' + skipDays + '天后', 'success.png');
+    } else {
+      // 续签后剩余时间解析失败，保守处理1天后再查
+      updateNextCheckDate(1, '续签成功，剩余时间解析失败，保守1天后检查');
+      await sendTG('✅', '续签成功', timeInfo + '\n剩余时间解析失败，保守1天后检查', 'success.png');
+    }
   } catch (e) {
     console.log('⚠️ 未找到延期按钮');
     await page.screenshot({ path: 'skip.png' });
@@ -165,7 +184,7 @@ async function tryRenew(page, beforeMins) {
 
 (async function main() {
   console.log('==================================================');
-  console.log('XServer 自动延期 (48h上限适配版)');
+  console.log('XServer 自动延期 (叠加续签动态调度版)');
   console.log('==================================================');
   if (!ACC || !ACC_PWD) { console.log('❌ 未找到账号或密码'); process.exit(1); }
   checkScheduling();
@@ -210,13 +229,8 @@ async function tryRenew(page, beforeMins) {
     } else {
       var h = totalMins / 60;
 
-      // 新政策：剩余 < 16h 才能续签，续签后上限 48h
-      // 伏击窗口：12h < 剩余 ≤ 16h（随机延迟最多2h，保留≥10h安全余量）
-      // 紧急模式：剩余 ≤ 12h，立即续签
-
       if (h > 16) {
-        // 探测模式：计算距离进入续签窗口（<16h）还有多久
-        // 提前2h到达，避免刚好踩线
+        // 探测模式：距离进入续签窗口（<16h）还有多久，提前2h到达
         var hoursUntilWindow = h - 16 - 2;
         var skipDays = Math.max(1, Math.floor(hoursUntilWindow / 24));
         console.log('🔭 探测模式: 剩余' + h.toFixed(1) + 'h，距续签窗口还有' + hoursUntilWindow.toFixed(1) + 'h，预约' + skipDays + '天后检查');
@@ -224,7 +238,6 @@ async function tryRenew(page, beforeMins) {
         updateNextCheckDate(skipDays, '探测模式，距窗口' + hoursUntilWindow.toFixed(1) + 'h');
       } else if (h > 12) {
         // 伏击模式：在续签窗口内（12h~16h），随机延迟0~2h后续签
-        // 最坏情况：剩余12.01h，延迟2h后剩余约10h，安全余量充足
         var maxDelaySec = 2 * 3600;
         var delay = Math.floor(Math.random() * maxDelaySec);
         console.log('🎯 伏击模式: 剩余' + h.toFixed(1) + 'h，随机延迟' + formatSeconds(delay) + '后续签');
